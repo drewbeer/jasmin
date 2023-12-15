@@ -81,38 +81,38 @@ class AmqpFactory(ClientFactory):
         """
         return self.channelReady
 
+    MAX_RETRIES = 5
+
     def clientConnectionFailed(self, connector, reason):
-        """Connection failed
-        """
         self.log.error("Connection failed. Reason: %s", str(reason))
         self.connected = False
 
-        if self.config.reconnectOnConnectionFailure and self.connectionRetry:
-            self.log.info("Reconnecting after %d seconds ...", self.config.reconnectOnConnectionFailureDelay)
-            self.reconnectTimer = reactor.callLater(self.config.reconnectOnConnectionFailureDelay,
-                                                    self.reConnect, connector)
-        else:
+        if self.reconnectTimer and self.reconnectTimer.active():
+            return
+
+        # Increment retry counter
+        self.retries += 1
+
+        if self.retries >= self.MAX_RETRIES:
+            self.log.error("Reached maximum reconnect attempts, aborting.")
             self.connectDeferred.errback(reason)
             self.exitDeferred.callback(self)
-            self.log.info("Exiting.")
+            return
+
+        # Calculate delay with exponential backoff
+        delay = 2**self.retries * self.config.reconnectOnConnectionFailureDelay
+
+        self.reconnectTimer = reactor.callLater(delay, self.reConnect, connector)
 
     def clientConnectionLost(self, connector, reason):
-        """Connection lost
-        """
         if not 'Connection was closed cleanly.' in str(reason):
-            # dont log an error when the queue closed as expected
+            # Log and attempt reconnect for unexpected losses
             self.log.error("Connection lost. Reason: %s", str(reason))
+            self.connected = False
+            self.reConnect(connector)
         else:
-            self.log.info("Connection lost. Reason: %s", str(reason))
-        self.connected = False
-
-        self.client = None
-
-        if self.config.reconnectOnConnectionLoss and self.connectionRetry:
-            self.log.info("Reconnecting after %d seconds ...", self.config.reconnectOnConnectionLossDelay)
-            self.reconnectTimer = reactor.callLater(self.config.reconnectOnConnectionLossDelay,
-                                                    self.reConnect, connector)
-        else:
+            # Graceful disconnect, don't retry
+            self.connected = False
             self.exitDeferred.callback(self)
             self.log.info("Exiting.")
 
@@ -126,10 +126,10 @@ class AmqpFactory(ClientFactory):
 
     def _connect(self):
         self.log.info('Establishing TCP connection to %s:%d', self.config.host, self.config.port)
+        connect_deferred = defer.Deferred()
         reactor.connectTCP(self.config.host, self.config.port, self)
-
-        self.preConnect()
-        return self.connectDeferred
+        connect_deferred.callback(lambda _: self.preConnect())
+        return connect_deferred
 
     def connect(self):
         self._connect()
